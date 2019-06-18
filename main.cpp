@@ -47,7 +47,9 @@ struct Result {
     bool isSuccess() const { return status == ResultType::Success; }
 
     void add(string name, string value) {
-        results.push_back(ResultItem {name, value} );
+        if (value.size() > 0) {
+            results.push_back(ResultItem {name, value} );
+        }
     }
     void add(string name, ResultMap value) {
         results.push_back(ResultItem {name, value} );
@@ -88,10 +90,7 @@ std::ostream &operator <<(std::ostream &o, const Result &result)
         };
 
         printVector(result.results, 0);
-
-
         o << "===========================================\n";
-
     }
     return o;
 }
@@ -195,6 +194,16 @@ Parser sequence(vector<Parser> parsers) {
     return reduce(parsers, andThen);
 }
 
+Parser nullParser() {
+    return [](string source) -> Result {
+        return Result::success("", source);
+    };
+}
+
+Parser opt(Parser parser) {
+    return choice({parser, nullParser()});
+}
+
 Parser many(Parser parser) {
     return [parser](string source) -> Result {
         string matched = "";
@@ -219,6 +228,7 @@ Parser many(Parser parser) {
     };
 }
 
+
 Parser many1(Parser parser) {
     return [parser](string source) -> Result {
         string matched = "";
@@ -238,16 +248,6 @@ Parser many1(Parser parser) {
             }
         }
     };
-}
-
-Parser nullParser() {
-    return [](string source) -> Result {
-        return Result::success("", source);
-    };
-}
-
-Parser opt(Parser parser) {
-    return choice({parser, nullParser()});
 }
 
 Parser takeLeft (Parser parser1, Parser parser2) {
@@ -274,24 +274,32 @@ Parser mapTo(Parser parser, string name) {
     };
 }
 
-// Parser listOf(Parser parser, char separator) {
-//     return [parser, separator](string source) -> Result {
-//         auto result = parser(source);
-//         auto separatorParser = parseChar(separator);
+Parser listOf(Parser whiteSpace, Parser parser, char separator) {
 
-//         if (result.isSuccess()) {
-//             if (result.results.size() == 0) {
-//                 result.add(name, result.matched);
-//             } else {
-//                 auto newResults = Result::success(result.matched, result.rest);
-//                 newResults.add(name, result.results);
-//                 return newResults;
-//             }
-//         }
-//         return result;
-//     };
-// }
+    auto separatorParser = parseChar(separator);
 
+    return sequence({
+        mapTo(
+            opt(
+                sequence({whiteSpace, parser})
+            ),
+            "item"
+        ),
+        many(
+            sequence({
+                whiteSpace, separatorParser,
+                whiteSpace, parser
+            })
+        )
+    });
+}
+
+Parser refParser(Parser &reference) {
+    return [&reference](string source) -> Result {
+        auto result = reference(source);
+        return result;
+    };
+};
 
 auto whiteSpace = opt(many(anyOf(" \t\r\n")));
 auto digit  = anyOf('0', '9');
@@ -304,17 +312,96 @@ auto identifier    = sequence({
     many(choice({letter, digit}))
 });
 
-auto integer = many(digit);
+auto integer = many1(digit);
 
 auto structKeyword = parseString("struct");
 auto constKeyword = parseString("const");
 auto functionKeyword = parseString("function");
 
+
 Parser parseBlock (Parser parser) {
     return sequence({
-        whiteSpace, parseChar('{'), many(parser), whiteSpace, parseChar('}')
+        whiteSpace, parseChar('{'),
+        parser,
+        whiteSpace, parseChar('}')
     });
 }
+
+Parser parseBinary(Parser parser, string op1, string op2, string type) {
+    return  mapTo(
+        sequence({
+            mapTo(parser, "left"),
+            many(
+                sequence({
+                    whiteSpace,
+                    mapTo(choice({
+                        parseString(op1),
+                        parseString(op2)
+                    }), "operator"),
+                    whiteSpace,
+                    mapTo(parser, "right")
+                })
+            )
+        }),
+        type
+    );
+}
+
+extern Parser blockParser;
+extern Parser expression;
+
+auto parenExp = sequence({
+    whiteSpace, parseChar('('),
+    whiteSpace, refParser(expression),
+    whiteSpace, parseChar(')')
+});
+
+auto value = choice({
+    integer,
+    identifier
+});
+
+auto mulExp = parseBinary(value,  "*",  "/",  "MulExpression");
+auto addExp = parseBinary(mulExp, "+",  "-",  "AddExpression");
+auto eqExp  = parseBinary(addExp, "==", "!=", "EqualityExpression");
+
+Parser expression = eqExp;
+
+auto parseIf = mapTo(
+    sequence({
+        whiteSpace, mapTo(parseString("if"), "type"),
+        whiteSpace, mapTo(expression, "condition"),
+        parseBlock(refParser(blockParser))
+    }),
+    "if"
+);
+
+auto parseFor = mapTo(
+    sequence({
+        whiteSpace, mapTo(parseString("for"), "type"),
+        whiteSpace, mapTo(identifier, "variable"),
+        whiteSpace, parseString("in"),
+        whiteSpace, mapTo(value, "iterable"),
+        parseBlock(refParser(blockParser))
+    }),
+    "for"
+);
+
+
+Parser blockParser = many(
+    choice({
+        parseIf,
+        parseFor,
+    })
+);
+
+auto parseParameter = mapTo(
+    sequence({
+        whiteSpace, mapTo(identifier, "type"),
+        whiteSpace, mapTo(identifier, "name"),
+    }),
+    "parameter"
+);
 
 auto parseConst = mapTo(
     sequence({
@@ -326,16 +413,37 @@ auto parseConst = mapTo(
     "const"
 );
 
+auto parseField = sequence({
+    whiteSpace, mapTo(identifier, "name"),
+    whiteSpace, mapTo(identifier, "field"),
+    whiteSpace, parseChar(';')
+});
+
+auto parseFunction = mapTo(
+    sequence({
+        whiteSpace, mapTo(functionKeyword, "type"),
+        whiteSpace, mapTo(identifier, "name"),
+        whiteSpace, parseChar('('),
+        mapTo(listOf(whiteSpace, parseParameter, ','), "parameters"),
+        whiteSpace, parseChar(')'),
+        parseBlock(
+            refParser(blockParser)
+        )
+    }),
+    "function"
+);
+
 auto parseStruct = mapTo(
     sequence({
         whiteSpace, mapTo(structKeyword, "type"),
         whiteSpace, mapTo(identifier, "name"),
         parseBlock(
-            sequence({
-                whiteSpace, mapTo(identifier, "name"),
-                whiteSpace, mapTo(identifier, "field"),
-                whiteSpace, parseChar(';')
-            })
+            many(
+                choice({
+                    parseField,
+                    parseFunction
+                })
+            )
         )
     }),
     "struct"
@@ -345,16 +453,17 @@ auto parse = mapTo(
     many(
         choice({
             parseStruct,
-            parseConst
+            parseConst,
+            parseFunction
         })
     ),
     "ast"
 );
 
-
-
 int main()
 {
+
+
     string source = R""(
 
         const x = 100
@@ -368,6 +477,9 @@ int main()
         struct Line {
             Point a;
             Point b;
+
+            function toString() { }
+            function interesect(Line other) { }
         }
 
         struct Triangle {
@@ -376,9 +488,11 @@ int main()
             Point c;
         }
 
-        function main () {
-        }
+        function main (int a, int b, int c) {
+            if a * b * c * d + 5*5 == 1000 * 20 {
 
+            }
+        }
     )"";
 
     auto result = parse(source);
